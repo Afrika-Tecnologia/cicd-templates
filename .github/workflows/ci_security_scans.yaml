@@ -1,0 +1,567 @@
+name: Veracode Workflow (Builds + Pipeline Scan + SAST)
+ 
+on:
+  workflow_call:
+    inputs:
+      build_artifact_name:
+        type: string
+        required: false
+        default: ''
+        description: 'Name of the build artifact. If empty, the repository source code will be scanned.'
+      build_artifact_path:
+        type: string
+        required: false
+        default: 'build'
+        description: 'The file path where the build artifact will be downloaded/extracted.'
+      build_artifact_exclude_patterns:
+        type: string
+        required: false
+        default: ''
+        description: 'Comma separated exclude patterns for files that dont need to be scanned (ex: test code)'
+      project_name:
+        type: string
+        required: false
+        default: ''
+        description: 'Project name. If left empty, the repository name will be used'
+      scan_path:
+        type: string
+        required: false
+        default: '.'
+        description: 'The path within the repository to scan. Defaults to the root directory.'
+      runner:
+        description: 'The runner label to use for the job.'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      artifact_suffix:
+        description: 'Suffix to append to artifact names for uniqueness in monorepos (e.g., -erp, -lms).'
+        type: string
+        required: false
+        default: ''
+      veracode_policy_name:
+        description: 'Name of the Veracode policy to apply in the Pipeline Scan step. If not provided, the default policy will be applied.'
+        type: string
+        required: false
+        default: 'Security Policy - Nivel 2'
+      staging_branch_patterns:
+        description: >
+          Comma-separated list of branch name patterns considered as staging/QA tier.
+          PRs targeting these branches will trigger Pipeline Scan + SAST (sandbox, non-blocking) + SCA + IaC.
+        type: string
+        required: false
+        default: 'develop,dev,stage,staging,qa,homolog,homologacao'
+      production_branch_patterns:
+        description: >
+          Comma-separated list of branch name patterns considered as production tier.
+          PRs targeting these branches will trigger Pipeline Scan + SAST (policy scan, blocking) + SCA + IaC.
+        type: string
+        required: false
+        default: 'main,master'
+    secrets:
+      SCAN_API_TOKEN:
+        description: 'Veracode SCA API Token'
+        required: true
+      SCAN_API_ID:
+        description: 'Veracode API ID'
+        required: true
+      SCAN_API_KEY:
+        description: 'Veracode API KEY'
+        required: true
+      BANTUU_API_KEY:
+        description: 'Bantuu API Key used pelo Veracode-Connect (pipeline scan e SAST). TODO: Migrar para chave própria da Cogna.'
+        required: false
+ 
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # MARK: Determine Tier
+  # ───────────────────────────────────────────────────────────────
+  # Analisa o contexto de branch/PR para decidir quais scans executar.
+  #
+  # Tiers:
+  #   Tier 1 (Commit/Push): Pipeline Scan + SCA + IaC
+  #   Tier 2 (PR → staging):  Pipeline Scan + SAST (sandbox, não-bloqueante) + SCA + IaC
+  #   Tier 3 (PR → production): Pipeline Scan + SAST (policy scan, bloqueante) + SCA + IaC
+  # ───────────────────────────────────────────────────────────────
+  determine_tier:
+    name: Determine Security Tier
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      is_pr: ${{ steps.tier.outputs.is_pr }}
+      is_staging_pr: ${{ steps.tier.outputs.is_staging_pr }}
+      is_production_pr: ${{ steps.tier.outputs.is_production_pr }}
+      run_sast: ${{ steps.tier.outputs.run_sast }}
+      use_sandbox: ${{ steps.tier.outputs.use_sandbox }}
+      tier: ${{ steps.tier.outputs.tier }}
+    steps:
+      - name: 🔍 Analyze branch context and determine scan tier
+        id: tier
+        shell: bash
+        env:
+          STAGING_PATTERNS: ${{ inputs.staging_branch_patterns }}
+          PRODUCTION_PATTERNS: ${{ inputs.production_branch_patterns }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # ── helpers ──
+          match_patterns() {
+            local target="$1"
+            local patterns_csv="$2"
+            IFS=',' read -ra PATTERNS <<< "$patterns_csv"
+            for pattern in "${PATTERNS[@]}"; do
+              pattern="$(echo "$pattern" | xargs)" # trim whitespace
+              [[ -z "$pattern" ]] && continue
+              if [[ "$target" == "$pattern" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # ── detect PR ──
+          IS_PR="false"
+          TARGET_BRANCH=""
+
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
+            IS_PR="true"
+            TARGET_BRANCH="$BASE_REF"
+          fi
+
+          echo "Event: $EVENT_NAME"
+          echo "Is PR: $IS_PR"
+          echo "Target branch: ${TARGET_BRANCH:-N/A}"
+          echo "Ref name: $REF_NAME"
+          echo "Staging patterns: $STAGING_PATTERNS"
+          echo "Production patterns: $PRODUCTION_PATTERNS"
+
+          # ── classify ──
+          IS_STAGING_PR="false"
+          IS_PRODUCTION_PR="false"
+          RUN_SAST="false"
+          USE_SANDBOX="false"
+          TIER="1"
+
+          if [[ "$IS_PR" == "true" && -n "$TARGET_BRANCH" ]]; then
+            if match_patterns "$TARGET_BRANCH" "$PRODUCTION_PATTERNS"; then
+              IS_PRODUCTION_PR="true"
+              RUN_SAST="true"
+              USE_SANDBOX="false"
+              TIER="3"
+            elif match_patterns "$TARGET_BRANCH" "$STAGING_PATTERNS"; then
+              IS_STAGING_PR="true"
+              RUN_SAST="true"
+              USE_SANDBOX="true"
+              TIER="2"
+            fi
+          fi
+
+          # ── summary ──
+          echo "### 🔐 Security Gate - Tier $TIER" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Event | \`$EVENT_NAME\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Is PR | \`$IS_PR\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target branch | \`${TARGET_BRANCH:-N/A}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tier | **$TIER** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run SAST | \`$RUN_SAST\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sandbox mode | \`$USE_SANDBOX\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          case "$TIER" in
+            1) echo "**Tier 1 (Commit):** Pipeline Scan + SCA + IaC" >> $GITHUB_STEP_SUMMARY ;;
+            2) echo "**Tier 2 (Staging PR):** Pipeline Scan + SAST (sandbox) + SCA + IaC" >> $GITHUB_STEP_SUMMARY ;;
+            3) echo "**Tier 3 (Production PR):** Pipeline Scan + SAST (policy, blocking) + SCA + IaC" >> $GITHUB_STEP_SUMMARY ;;
+          esac
+
+          # ── outputs ──
+          echo "is_pr=$IS_PR" >> "$GITHUB_OUTPUT"
+          echo "is_staging_pr=$IS_STAGING_PR" >> "$GITHUB_OUTPUT"
+          echo "is_production_pr=$IS_PRODUCTION_PR" >> "$GITHUB_OUTPUT"
+          echo "run_sast=$RUN_SAST" >> "$GITHUB_OUTPUT"
+          echo "use_sandbox=$USE_SANDBOX" >> "$GITHUB_OUTPUT"
+          echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────
+  # MARK: Autopackager
+  # ───────────────────────────────────────────────────────────────
+  autopackager:
+    name: Veracode Auto Packager
+    needs: [determine_tier]
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: 🛎️ Checkout repository (if no artifact provided)
+        uses: actions/checkout@v4
+        if: inputs.build_artifact_name == ''
+        with:
+          path: 'source'
+
+      - name: 🔽 Download build artifact (if provided)
+        uses: actions/download-artifact@v4
+        if: inputs.build_artifact_name != ''
+        with:
+          name: ${{ inputs.build_artifact_name }}
+          path: ${{ inputs.build_artifact_path }}
+
+      - name: 📂 Set working directory
+        id: set_workdir
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.build_artifact_name }}" ]]; then
+            echo "path=${{ inputs.build_artifact_path }}" >> "$GITHUB_OUTPUT"
+          else
+            FULL_PATH="source/${{ inputs.scan_path }}"
+            CLEAN_PATH=$(realpath "$FULL_PATH")
+            echo "path=$CLEAN_PATH" >> "$GITHUB_OUTPUT"
+          fi
+ 
+      # Lógica de pré-checagem com otimização para *-plain.jar
+      - name: 🔎 Pré-checagem de binários e empacotamento otimizado
+        id: precheck_binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+      
+          WORKDIR="${{ steps.set_workdir.outputs.path }}"
+          echo "Varredura recursiva em: $WORKDIR"
+          
+          if [[ -z "${WORKDIR:-}" ]]; then
+            echo "ERRO: WORKDIR está vazio."; exit 1
+          fi
+          if [[ ! -d "$WORKDIR" ]]; then
+            echo "ERRO: WORKDIR não existe: $WORKDIR"; exit 1
+          fi
+          WORKDIR_ABS="$(cd "$WORKDIR" && pwd -P)"
+          if [[ -z "$WORKDIR_ABS" || "$WORKDIR_ABS" == "/" ]]; then
+            echo "ERRO: WORKDIR resolve para raiz; abortando."; exit 1
+          fi
+      
+          if [[ -n "${GITHUB_WORKSPACE:-}" ]]; then
+            WS_ABS="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+            case "$WORKDIR_ABS" in
+              "$WS_ABS"/*|"$WS_ABS") : ;; # ok
+              *) echo "ERRO: WORKDIR não está dentro de GITHUB_WORKSPACE."; exit 1 ;;
+            esac
+          fi
+      
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+      
+          OUT_DIR="${GITHUB_WORKSPACE}/veracode-out"
+          mkdir -p "$OUT_DIR"
+      
+          BUNDLE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$BUNDLE_DIR"' EXIT
+      
+          FOUND_ANY=false
+      
+          # Lógica de otimização para JARs
+          declare -a JARS_ALL=()
+          declare -a JARS_PLAIN=()
+      
+          while IFS= read -r -d '' j; do
+            JARS_ALL+=("$j")
+          done < <(find "$WORKDIR_ABS" \
+                    \( -type d \( -name node_modules -o -name .git -o -name .svn -o -name .hg -o -name vendor -o -name .m2 -o -name .gradle -o -name .ivy2 -o -name .pnpm-store -o -name .yarn -o -name .cache -o -name .venv -o -name venv -o -name .terraform \) -prune \) -o \
+                    \( -type f -iname '*.jar' -print0 \))
+      
+          while IFS= read -r -d '' pj; do
+            JARS_PLAIN+=("$pj")
+          done < <(find "$WORKDIR_ABS" \
+                    \( -type d \( -name node_modules -o -name .git -o -name .svn -o -name .hg -o -name vendor -o -name .m2 -o -name .gradle -o -name .ivy2 -o -name .pnpm-store -o -name .yarn -o -name .cache -o -name .venv -o -name venv -o -name .terraform \) -prune \) -o \
+                    \( -type f -iname '*-plain.jar' -print0 \))
+      
+          USE_ONLY_PLAIN=false
+          if (( ${#JARS_ALL[@]} >= 2 )) && (( ${#JARS_PLAIN[@]} >= 1 )); then
+            USE_ONLY_PLAIN=true
+          fi
+      
+          if $USE_ONLY_PLAIN; then
+            echo "::notice::Otimização ativada: ≥2 JARs e pelo menos um '-plain' encontrado. Usando SOMENTE os arquivos '-plain.jar'."
+            SELECTED_JARS=("${JARS_PLAIN[@]}")
+          else
+            echo "::notice::Otimização não aplicável. Usando TODOS os JARs encontrados."
+            SELECTED_JARS=("${JARS_ALL[@]}")
+          fi
+
+          # Lógica para outros binários
+          declare -a OTHER_BINS=()
+          while IFS= read -r -d '' f; do
+            OTHER_BINS+=("$f")
+          done < <(find "$WORKDIR_ABS" \
+                    \( -type d \( -name node_modules -o -name .git -o -name .svn -o -name .hg -o -name vendor -o -name .m2 -o -name .gradle -o -name .ivy2 -o -name .pnpm-store -o -name .yarn -o -name .cache -o -name .venv -o -name venv -o -name .terraform \) -prune \) -o \
+                    \( -type f \( -iname '*.dll' -o -iname '*.pdb' -o -iname '*.war' \) -print0 \))
+      
+          copy_with_collision() {
+            local src="$1"
+            local base="$(basename "$src")"
+            if [[ -e "$BUNDLE_DIR/$base" ]]; then
+              local i=1
+              while [[ -e "$BUNDLE_DIR/${i}_$base" ]]; do i=$((i+1)); done
+              cp -f -- "$src" "$BUNDLE_DIR/${i}_$base"
+              echo "Adicionado (colisão): ${i}_$base"
+            else
+              cp -f -- "$src" "$BUNDLE_DIR/$base"
+              echo "Adicionado: $base"
+            fi
+            FOUND_ANY=true
+          }
+      
+          for j in "${SELECTED_JARS[@]}"; do
+            copy_with_collision "$j"
+          done
+      
+          for b in "${OTHER_BINS[@]}"; do
+            copy_with_collision "$b"
+          done
+      
+          if $FOUND_ANY; then
+            echo "Arquivos compilados detectados; gerando pacote..."
+            (cd "$BUNDLE_DIR" && zip -qr "$OUT_DIR/analysisPack.zip" .)
+      
+            shopt -s dotglob nullglob
+            CONTENTS=("$WORKDIR_ABS"/*)
+           if ((${#CONTENTS[@]})); then
+              rm -rf -- "${CONTENTS[@]}"
+            fi
+            shopt -u dotglob nullglob
+      
+            cp -f -- "$OUT_DIR/analysisPack.zip" "$WORKDIR_ABS/analysisPack.zip"
+      
+            echo "skip_packager=true" >> "$GITHUB_OUTPUT"
+            echo "Fluxo alternativo - Arquivos compilados detectados (com regra de plain aplicada)."
+          else
+            echo "Fluxo original - Nenhum arquivo compilado detectado."
+            echo "skip_packager=false" >> "$GITHUB_OUTPUT"
+          fi
+ 
+      - name: ⬇️ Instalar Veracode CLI
+        if: steps.precheck_binaries.outputs.skip_packager == 'false'
+        run: |
+          set -euo pipefail
+          curl -fsS https://tools.veracode.com/veracode-cli/install | sh
+          ./veracode version
+ 
+      - name: 📦 Executar Auto Packager (verbose) no artifact baixado
+        id: run_autopackager
+        if: steps.precheck_binaries.outputs.skip_packager == 'false'
+        run: |
+          set -euo pipefail
+          SRC_DIR="${{ steps.set_workdir.outputs.path }}"
+          out_dir="veracode-out"
+          mkdir -p "$out_dir"
+          ./veracode package --source "$SRC_DIR" --output "$out_dir" --trust --verbose
+          echo "✅ Pacotes gerados:"
+          ls -lh "$out_dir"
+      
+      - name: 🧩 Compilar pacotes em analysisPack.zip
+        if: steps.precheck_binaries.outputs.skip_packager == 'false' && steps.run_autopackager.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+ 
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/veracode-out"
+ 
+          sudo apt-get update -y
+          sudo apt-get install -y zip unzip
+ 
+          cd "${ARTIFACT_DIR}"
+ 
+          mkdir -p merged
+ 
+          echo "Procurando arquivos .zip em ${ARTIFACT_DIR}"
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -gt 0 ]; then
+            for zipf in "${zips[@]}"; do
+              echo "Extraindo $zipf para merged/"
+              unzip -oq "$zipf" -d merged/
+            done
+          else
+            echo "Nenhum arquivo .zip encontrado (seguiremos apenas com as pastas/arquivos gerados)."
+          fi
+ 
+          for item in *; do
+            if [[ "$item" != "merged" && "$item" != *.zip ]]; then
+              echo "Movendo $item para merged/"
+              mv "$item" merged/
+            fi
+          done
+ 
+          echo "Compactando tudo em analysisPack.zip"
+          rm -f /tmp/analysisPack.zip
+          (cd merged && zip -qr /tmp/analysisPack.zip .)
+ 
+          echo "Limpando ${ARTIFACT_DIR}"
+          rm -rf ./*
+ 
+          mv /tmp/analysisPack.zip ./analysisPack.zip
+ 
+          echo "Novo pacote pronto: ${ARTIFACT_DIR}/analysisPack.zip"
+          ls -lh "${ARTIFACT_DIR}/analysisPack.zip"
+ 
+      - name: 📤 Upload analysisPack.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysisPack${{ inputs.artifact_suffix }}
+          path: veracode-out/analysisPack.zip
+
+  # TODO: Vamos unificar tudo com a Action criada pelo Juan que fará a execução de forma assíncrona e melhor otimizada, o retorno dado por cada step, podemos juntar tudo no Summary final.
+  # ───────────────────────────────────────────────────────────────
+  # MARK: SCA
+  # ───────────────────────────────────────────────────────────────
+  sca:
+    name: Veracode SCA
+    runs-on: ${{ inputs.runner }}
+    steps:          
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Veracode SCA
+        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
+        with:
+          veracode_api_id: ${{ secrets.SCAN_API_ID }}
+          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
+          enable_auto_packager: 'false'
+          enable_baseline: 'false'
+          enable_upload_scan: 'false'
+          veracode_sandbox: 'false'
+          policy_fail: 'false'
+          enable_sca: 'true'
+          veracode_sca_token: ${{ secrets.SCAN_API_TOKEN }}
+          enable_iac: 'false'
+  # ───────────────────────────────────────────────────────────────
+  # MARK: IaC
+  # ───────────────────────────────────────────────────────────────
+  iac:
+    name: Veracode IaC
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Run Veracode IaC
+        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
+        with:
+          veracode_api_id: ${{ secrets.SCAN_API_ID }}
+          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
+          enable_auto_packager: 'false'
+          enable_baseline: 'false'
+          enable_upload_scan: 'false'
+          veracode_sandbox: 'false'
+          policy_fail: 'false'
+          enable_iac: 'true'
+
+  # ───────────────────────────────────────────────────────────────
+  # MARK: Pipeline Scan
+  # ───────────────────────────────────────────────────────────────
+  pipeline_scan:
+    name: Pipeline Scan
+    runs-on: ${{ inputs.runner }}
+    needs: [autopackager]
+    if: always()
+    steps:
+      - name: Download analysisPack artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: analysisPack${{ inputs.artifact_suffix }}
+          path: ${{ inputs.build_artifact_path }}
+ 
+      - name: Preparar arquivo para o scan
+        id: prepare_scan_file
+        env:
+          EXCLUDE_PATTERNS: ${{ inputs.build_artifact_exclude_patterns }}
+        run: |
+          set -euo pipefail
+          WORKDIR="${{ inputs.build_artifact_path }}"
+          echo "Conteúdo do path:"
+          ls -lah "$WORKDIR" || true
+ 
+          if [ -f "$WORKDIR/analysisPack.zip" ]; then
+            echo "file=$WORKDIR/analysisPack.zip" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+ 
+          if [[ -n "${EXCLUDE_PATTERNS}" ]]; then
+            IFS=',' read -ra EXCLUDE_PATTERNS_ARRAY <<< "${EXCLUDE_PATTERNS}"
+            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")" -x "${EXCLUDE_PATTERNS_ARRAY[@]}")
+          else
+            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")")
+          fi
+          echo "file=${WORKDIR}.zip" >> $GITHUB_OUTPUT
+
+      - name: Run Veracode Pipeline Scan
+        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
+        with:
+          bantuu_api_key: ${{ secrets.BANTUU_API_KEY }} # TODO: Passar a API Key para a Cogna
+          veracode_api_id: ${{ secrets.SCAN_API_ID }}
+          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
+          scan_file: ${{ steps.prepare_scan_file.outputs.file }}
+          enable_auto_packager: 'false'
+          enable_baseline: 'true'
+          policy_fail: 'true'
+          fail_on_severity: 'Very High, High' # TODO: Temporário, deve ser removido após configuração da policy
+          veracode_policy_name: ${{ inputs.veracode_policy_name }}
+
+  # ───────────────────────────────────────────────────────────────
+  # MARK: SAST (Upload & Scan)
+  # ───────────────────────────────────────────────────────────────
+  # Runs only on PRs targeting staging or production branches.
+  # - Staging PRs:    sandbox mode (non-blocking)
+  # - Production PRs: policy scan (blocking)
+  # ───────────────────────────────────────────────────────────────
+  sast:
+    name: Veracode Upload & SAST
+    runs-on: ${{ inputs.runner }}
+    needs: [determine_tier, pipeline_scan]
+    if: always() && needs.determine_tier.outputs.run_sast == 'true'
+    steps:
+      - name: Download analysisPack artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: analysisPack${{ inputs.artifact_suffix }}
+          path: ${{ inputs.build_artifact_path }}
+ 
+      - name: Preparar arquivo para o SAST
+        id: prepare_sast_file
+        env:
+          EXCLUDE_PATTERNS: ${{ inputs.build_artifact_exclude_patterns }}
+        run: |
+          set -euo pipefail
+          WORKDIR="${{ inputs.build_artifact_path }}"
+          echo "Conteúdo do path:"
+          ls -lah "$WORKDIR" || true
+ 
+          if [ -f "$WORKDIR/analysisPack.zip" ]; then
+            echo "file=$WORKDIR/analysisPack.zip" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+ 
+          if [[ -n "${EXCLUDE_PATTERNS}" ]]; then
+            IFS=',' read -ra EXCLUDE_PATTERNS_ARRAY <<< "${EXCLUDE_PATTERNS}"
+            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")" -x "${EXCLUDE_PATTERNS_ARRAY[@]}")
+          else
+            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")")
+          fi
+          echo "file=${WORKDIR}.zip" >> $GITHUB_OUTPUT
+
+      - name: Run Veracode Upload & SAST
+        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
+        env:
+          PROJECT_NAME: ${{ inputs.project_name || (inputs.scan_path == '.' && github.repository || format('{0}/{1}', github.repository, inputs.scan_path)) }}
+        with:
+          bantuu_api_key: ${{ secrets.BANTUU_API_KEY }} # TODO: Passar a API Key para a Cogna
+          veracode_api_id: ${{ secrets.SCAN_API_ID }}
+          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
+          scan_file: ${{ steps.prepare_sast_file.outputs.file }}
+          enable_auto_packager: 'false'
+          enable_baseline: 'false'
+          policy_fail: ${{ needs.determine_tier.outputs.is_production_pr }}
+          fail_on_severity: 'Very High, High' # TODO: Temporário, deve ser removido após configuração da policy
+          enable_pipelinescan: 'false'
+          enable_upload_scan: 'true'
+          veracode_sandbox: ${{ needs.determine_tier.outputs.use_sandbox }}
+          veracode_appname: 'GitHub - ${{ env.PROJECT_NAME }}'
+
