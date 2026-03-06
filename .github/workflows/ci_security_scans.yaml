@@ -486,7 +486,7 @@ jobs:
           enable_auto_packager: 'false'
           scan_file: ${{ steps.prepare_scan_file.outputs.file }}
           enable_baseline: 'true'
-          enable_upload_scan: 'true'
+          enable_upload_scan: ${{ needs.determine_tier.outputs.run_sast }}
           policy_fail: 'true'
           enable_sca: 'true'
           veracode_sca_token: ${{ secrets.SCAN_API_TOKEN }}
