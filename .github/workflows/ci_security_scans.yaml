@@ -413,6 +413,7 @@ jobs:
 
   security-gate:
     name: Veracode Security Gate
+    needs: [autopackager]
     runs-on: ${{ inputs.runner }}
     steps:
       - name: Checkout
