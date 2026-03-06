@@ -205,7 +205,29 @@ jobs:
           name: ${{ inputs.build_artifact_name }}
           path: ${{ inputs.build_artifact_path }}
 
-      - name: 📂 Set working directory
+      - name: � Extrair artefato zip (se aplicável)
+        if: inputs.build_artifact_name != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKDIR="${{ inputs.build_artifact_path }}"
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq unzip
+          ZIPS=( "$WORKDIR"/*.zip )
+          if [[ ${#ZIPS[@]} -gt 0 && -f "${ZIPS[0]}" ]]; then
+            echo "Zip(s) detectado(s) em $WORKDIR — extraindo para os arquivos-fonte ficarem disponíveis ao packager..."
+            for zipf in "${ZIPS[@]}"; do
+              echo "  → Extraindo $zipf"
+              unzip -oq "$zipf" -d "$WORKDIR"
+              rm -f "$zipf"
+            done
+            echo "Extração concluída. Conteúdo de $WORKDIR:"
+            ls -lah "$WORKDIR" | head -30
+          else
+            echo "Nenhum zip encontrado em $WORKDIR — nenhuma extração necessária."
+          fi
+
+      - name: �📂 Set working directory
         id: set_workdir
         shell: bash
         run: |
@@ -413,8 +435,8 @@ jobs:
 
   security-gate:
     name: Veracode Security Gate
-    needs: [autopackager]
     runs-on: ${{ inputs.runner }}
+    needs: [autopackager]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
