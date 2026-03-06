@@ -49,14 +49,14 @@ on:
           PRs targeting these branches will trigger Pipeline Scan + SAST (sandbox, non-blocking) + SCA + IaC.
         type: string
         required: false
-        default: 'develop,dev,stage,staging,qa,homolog,homologacao'
+        default: 'hml,stg,develop,dev,stage,staging,qa,homolog,homologacao,homol,testing,test,tests'
       production_branch_patterns:
         description: >
           Comma-separated list of branch name patterns considered as production tier.
           PRs targeting these branches will trigger Pipeline Scan + SAST (policy scan, blocking) + SCA + IaC.
         type: string
         required: false
-        default: 'main,master'
+        default: 'main,master,prod,prd,production,release,hotfix'
     secrets:
       SCAN_API_TOKEN:
         description: 'Veracode SCA API Token'
@@ -216,8 +216,7 @@ jobs:
             CLEAN_PATH=$(realpath "$FULL_PATH")
             echo "path=$CLEAN_PATH" >> "$GITHUB_OUTPUT"
           fi
- 
-      # Lógica de pré-checagem com otimização para *-plain.jar
+
       - name: 🔎 Pré-checagem de binários e empacotamento otimizado
         id: precheck_binaries
         shell: bash
@@ -408,61 +407,17 @@ jobs:
           name: analysisPack${{ inputs.artifact_suffix }}
           path: veracode-out/analysisPack.zip
 
-  # TODO: Vamos unificar tudo com a Action criada pelo Juan que fará a execução de forma assíncrona e melhor otimizada, o retorno dado por cada step, podemos juntar tudo no Summary final.
   # ───────────────────────────────────────────────────────────────
-  # MARK: SCA
+  # MARK: Veracode Sec Gate
   # ───────────────────────────────────────────────────────────────
-  sca:
-    name: Veracode SCA
-    runs-on: ${{ inputs.runner }}
-    steps:          
-      - name: Checkout Repository
-        uses: actions/checkout@v4
 
-      - name: Run Veracode SCA
-        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
-        with:
-          veracode_api_id: ${{ secrets.SCAN_API_ID }}
-          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
-          enable_auto_packager: 'false'
-          enable_baseline: 'false'
-          enable_upload_scan: 'false'
-          veracode_sandbox: 'false'
-          policy_fail: 'false'
-          enable_sca: 'true'
-          veracode_sca_token: ${{ secrets.SCAN_API_TOKEN }}
-          enable_iac: 'false'
-  # ───────────────────────────────────────────────────────────────
-  # MARK: IaC
-  # ───────────────────────────────────────────────────────────────
-  iac:
-    name: Veracode IaC
+  security-gate:
+    name: Veracode Security Gate
     runs-on: ${{ inputs.runner }}
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-      
-      - name: Run Veracode IaC
-        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
-        with:
-          veracode_api_id: ${{ secrets.SCAN_API_ID }}
-          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
-          enable_auto_packager: 'false'
-          enable_baseline: 'false'
-          enable_upload_scan: 'false'
-          veracode_sandbox: 'false'
-          policy_fail: 'false'
-          enable_iac: 'true'
 
-  # ───────────────────────────────────────────────────────────────
-  # MARK: Pipeline Scan
-  # ───────────────────────────────────────────────────────────────
-  pipeline_scan:
-    name: Pipeline Scan
-    runs-on: ${{ inputs.runner }}
-    needs: [autopackager]
-    if: always()
-    steps:
       - name: Download analysisPack artifact
         uses: actions/download-artifact@v4
         with:
@@ -492,76 +447,22 @@ jobs:
           fi
           echo "file=${WORKDIR}.zip" >> $GITHUB_OUTPUT
 
-      - name: Run Veracode Pipeline Scan
-        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
-        with:
-          bantuu_api_key: ${{ secrets.BANTUU_API_KEY }} # TODO: Passar a API Key para a Cogna
-          veracode_api_id: ${{ secrets.SCAN_API_ID }}
-          veracode_api_key: ${{ secrets.SCAN_API_KEY }}
-          scan_file: ${{ steps.prepare_scan_file.outputs.file }}
-          enable_auto_packager: 'false'
-          enable_baseline: 'true'
-          policy_fail: 'true'
-          fail_on_severity: 'Very High, High' # TODO: Temporário, deve ser removido após configuração da policy
-          veracode_policy_name: ${{ inputs.veracode_policy_name }}
-
-  # ───────────────────────────────────────────────────────────────
-  # MARK: SAST (Upload & Scan)
-  # ───────────────────────────────────────────────────────────────
-  # Runs only on PRs targeting staging or production branches.
-  # - Staging PRs:    sandbox mode (non-blocking)
-  # - Production PRs: policy scan (blocking)
-  # ───────────────────────────────────────────────────────────────
-  sast:
-    name: Veracode Upload & SAST
-    runs-on: ${{ inputs.runner }}
-    needs: [determine_tier, pipeline_scan]
-    if: always() && needs.determine_tier.outputs.run_sast == 'true'
-    steps:
-      - name: Download analysisPack artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: analysisPack${{ inputs.artifact_suffix }}
-          path: ${{ inputs.build_artifact_path }}
- 
-      - name: Preparar arquivo para o SAST
-        id: prepare_sast_file
-        env:
-          EXCLUDE_PATTERNS: ${{ inputs.build_artifact_exclude_patterns }}
-        run: |
-          set -euo pipefail
-          WORKDIR="${{ inputs.build_artifact_path }}"
-          echo "Conteúdo do path:"
-          ls -lah "$WORKDIR" || true
- 
-          if [ -f "$WORKDIR/analysisPack.zip" ]; then
-            echo "file=$WORKDIR/analysisPack.zip" >> $GITHUB_OUTPUT
-            exit 0
-          fi
- 
-          if [[ -n "${EXCLUDE_PATTERNS}" ]]; then
-            IFS=',' read -ra EXCLUDE_PATTERNS_ARRAY <<< "${EXCLUDE_PATTERNS}"
-            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")" -x "${EXCLUDE_PATTERNS_ARRAY[@]}")
-          else
-            (cd "$(dirname "$WORKDIR")" && zip -r "${WORKDIR}.zip" "$(basename "$WORKDIR")")
-          fi
-          echo "file=${WORKDIR}.zip" >> $GITHUB_OUTPUT
-
-      - name: Run Veracode Upload & SAST
-        uses: Afrika-Tecnologia/Veracode-Connect@v1.1
+      - name: Pipeline Scan + SCA + IaC + Upload & Scan (scan_file)
+        uses: Afrika-Tecnologia/Veracode-Connect@v1
         env:
           PROJECT_NAME: ${{ inputs.project_name || (inputs.scan_path == '.' && github.repository || format('{0}/{1}', github.repository, inputs.scan_path)) }}
         with:
-          bantuu_api_key: ${{ secrets.BANTUU_API_KEY }} # TODO: Passar a API Key para a Cogna
+          bantuu_api_key: ${{ secrets.BANTUU_API_KEY }}
           veracode_api_id: ${{ secrets.SCAN_API_ID }}
           veracode_api_key: ${{ secrets.SCAN_API_KEY }}
-          scan_file: ${{ steps.prepare_sast_file.outputs.file }}
           enable_auto_packager: 'false'
-          enable_baseline: 'false'
-          policy_fail: ${{ needs.determine_tier.outputs.is_production_pr }}
-          fail_on_severity: 'Very High, High' # TODO: Temporário, deve ser removido após configuração da policy
-          enable_pipelinescan: 'false'
+          scan_file: ${{ steps.prepare_scan_file.outputs.file }}
+          enable_baseline: 'true'
           enable_upload_scan: 'true'
+          policy_fail: 'true'
+          enable_sca: 'true'
+          veracode_sca_token: ${{ secrets.SCAN_API_TOKEN }}
+          enable_iac: 'true'
           veracode_sandbox: ${{ needs.determine_tier.outputs.use_sandbox }}
           veracode_appname: 'GitHub - ${{ env.PROJECT_NAME }}'
-
+          veracode_policy_name: ${{ inputs.veracode_policy_name }}
